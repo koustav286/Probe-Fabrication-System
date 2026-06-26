@@ -1,0 +1,383 @@
+// Z-Axis Linear Motion Controller for Tungsten Tip Electrochemical Etching
+// Hardware: Arduino Uno/Nano + A4988 Stepper Driver + MinebeaMitsumi Hybrid
+// Stepper
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+// WIRING — A4988 Module
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+//  A4988 Pin  │  Connect To
+//  ───────────┼──────────────────────────────────────────────────────────────────
+//  VMOT       │  Motor power supply (+) 8–35 V   ** 100 µF cap across VMOT–GND
+//  ** GND (mot)  │  Motor power supply (−) 1A, 1B     │  Stepper coil 1 (A+,
+//  A−) 2A, 2B     │  Stepper coil 2 (B+, B−) VDD        │  Arduino 5 V GND
+//  (logic)│  Arduino GND STEP       │  Arduino D3 DIR        │  Arduino D2
+//  ENABLE     │  Arduino D4  (LOW = enabled, HIGH = driver off / free-spin)
+//  SLEEP      │  Tie to RESET  (both HIGH → driver active)
+//  RESET      │  Tie to SLEEP
+//  MS1        │  Arduino D5  (microstepping selection)
+//  MS2        │  Arduino D6
+//  MS3        │  Arduino D7
+//
+// ═══════════════════════════════════════════════════════════════════════════════
+// CURRENT LIMIT — set Vref on the A4988 pot
+//   I_trip = Vref / (8 × Rs)       (Rs = sense resistor, typ. 0.068 Ω on most
+//   boards) For a 0.5 A motor:  Vref = 0.5 × 8 × 0.068 = 0.272 V Measure
+//   between Vref test pad and GND with the pot adjusted.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#include <AccelStepper.h>
+
+// ---------------------------------------------------------------------------
+//  PIN ASSIGNMENTS
+// ---------------------------------------------------------------------------
+const int PIN_STEP = 2;
+const int PIN_DIR = 3;
+const int PIN_ENABLE = 4;
+
+AccelStepper stepper(AccelStepper::DRIVER, PIN_STEP, PIN_DIR);
+const int PIN_MS1 = 5;
+const int PIN_MS2 = 6;
+const int PIN_MS3 = 7;
+
+// Direction semantics — adjust if your wiring is reversed
+const int DIR_UP = HIGH;  // wire moves UP (out of etchant)
+const int DIR_DOWN = LOW; // wire moves DOWN (into etchant)
+
+// ---------------------------------------------------------------------------
+//  MECHANICAL PARAMETERS — adapt to your lead screw / stage
+// ---------------------------------------------------------------------------
+// Motor: 1.8°/step → 200 full steps/rev (standard hybrid stepper)
+const int FULL_STEPS_PER_REV = 200;
+
+// Lead screw / stage pitch: linear travel per revolution (µm)
+// Example: M3×0.5 lead screw → 500 µm/rev.  Adjust this for your stage.
+const float PITCH_UM = 500.0;
+
+// Microstepping divisor (1 = full, 2 = half, 4 = quarter, 8 = eighth, 16 =
+// sixteenth)
+int microstepping = 16;
+
+// Derived: microsteps per revolution, and µm per microstep
+float microstepsPerRev() { return (float)FULL_STEPS_PER_REV * microstepping; }
+float umPerMicrostep() { return PITCH_UM / microstepsPerRev(); }
+
+// ---------------------------------------------------------------------------
+//  ENABLE / DISABLE DRIVER
+// ---------------------------------------------------------------------------
+void enableDriver() { stepper.enableOutputs(); }
+void disableDriver() { stepper.disableOutputs(); }
+
+// ---------------------------------------------------------------------------
+//  MICROSTEPPING CONFIGURATION
+// ---------------------------------------------------------------------------
+//  MS1  MS2  MS3  │  Step mode
+//   L    L    L   │  Full step
+//   H    L    L   │  1/2  step
+//   L    H    L   │  1/4  step
+//   H    H    L   │  1/8  step
+//   H    H    H   │  1/16 step
+void applyMicrostepping(int divisor) {
+  switch (divisor) {
+  case 1:
+    digitalWrite(PIN_MS1, LOW);
+    digitalWrite(PIN_MS2, LOW);
+    digitalWrite(PIN_MS3, LOW);
+    break;
+  case 2:
+    digitalWrite(PIN_MS1, HIGH);
+    digitalWrite(PIN_MS2, LOW);
+    digitalWrite(PIN_MS3, LOW);
+    break;
+  case 4:
+    digitalWrite(PIN_MS1, LOW);
+    digitalWrite(PIN_MS2, HIGH);
+    digitalWrite(PIN_MS3, LOW);
+    break;
+  case 8:
+    digitalWrite(PIN_MS1, HIGH);
+    digitalWrite(PIN_MS2, HIGH);
+    digitalWrite(PIN_MS3, LOW);
+    break;
+  case 16:
+  default:
+    digitalWrite(PIN_MS1, HIGH);
+    digitalWrite(PIN_MS2, HIGH);
+    digitalWrite(PIN_MS3, HIGH);
+    divisor = 16;
+    break;
+  }
+  microstepping = divisor;
+}
+
+// ---------------------------------------------------------------------------
+//  CORE MOTION PRIMITIVE
+//  Move `steps` microsteps at the given speed (µm/s).
+//  Positive steps = UP, negative = DOWN.
+//  Returns actual steps executed.
+// ---------------------------------------------------------------------------
+// Global flag to track if we are in continuous velocity mode
+bool continuousMode = false;
+
+long moveSteps(long steps, float speedUmPerSec) {
+  if (steps == 0 || speedUmPerSec <= 0)
+    return 0;
+
+  continuousMode = false; // Switch to positional mode
+  float stepsPerSec = speedUmPerSec / umPerMicrostep();
+  stepper.setMaxSpeed(stepsPerSec);
+  stepper.setAcceleration(stepsPerSec *
+                          10.0); // High acceleration for quick start
+
+  stepper.move(steps);
+  // REMOVED: stepper.runToPosition() to make this non-blocking
+
+  return steps;
+}
+
+// ---------------------------------------------------------------------------
+//  HIGH-LEVEL MOTION: move a given distance (µm) at a given speed (µm/s)
+// ---------------------------------------------------------------------------
+void moveUm(float distanceUm, float speedUmPerSec) {
+  long steps = (long)(distanceUm / umPerMicrostep());
+  Serial.print(F("Moving "));
+  Serial.print(distanceUm, 1);
+  Serial.print(F(" um at "));
+  Serial.print(speedUmPerSec, 1);
+  Serial.print(F(" um/s  ("));
+  Serial.print(abs(steps));
+  Serial.println(F(" microsteps)"));
+
+  moveSteps(steps, speedUmPerSec);
+  reportPosition();
+}
+
+// ---------------------------------------------------------------------------
+//  HIGH-LEVEL MOTION: move for a given duration (seconds) at a given speed
+// ---------------------------------------------------------------------------
+void moveForDuration(float speedUmPerSec, float durationSec) {
+  float distUm = speedUmPerSec * durationSec;
+  moveUm(distUm, fabs(speedUmPerSec));
+}
+
+// ---------------------------------------------------------------------------
+//  POSITION REPORTING
+// ---------------------------------------------------------------------------
+void reportPosition() {
+  long posSteps = stepper.currentPosition();
+  float posUm = posSteps * umPerMicrostep();
+  Serial.print(F("Position: "));
+  Serial.print(posUm, 2);
+  Serial.print(F(" um  ("));
+  Serial.print(posSteps);
+  Serial.println(F(" steps)"));
+}
+
+// ---------------------------------------------------------------------------
+//  (Etch profile removed — RPi takes over logic dynamically)
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+//  SERIAL COMMAND INTERFACE
+//  Commands (newline-terminated):
+//    U <um> <um/s>       Move up by <um> at <um/s>
+//    D <um> <um/s>       Move down by <um> at <um/s>
+//    S <steps> <um/s>    Move raw steps (+ = up, − = down) at <um/s>
+//    T <um/s> <sec>      Move at speed for duration (+ = up)
+//    V <um/s>            Move continuously at given speed (+ = up)
+//    M <1|2|4|8|16>      Set microstepping divisor
+//    P                   Report current position
+//    H                   Set current position as home (zero)
+//    X                   Disable driver (free-spin / release torque)
+//    R                   Re-enable driver
+//    ?                   Print help
+// ---------------------------------------------------------------------------
+void processCommand(const String &cmd) {
+  if (cmd.length() == 0)
+    return;
+
+  char op = cmd.charAt(0);
+  String args = cmd.substring(1);
+  args.trim();
+
+  switch (op) {
+  case 'U':
+  case 'u': {
+    float dist = 0, spd = 0;
+    sscanf(args.c_str(), "%f %f", &dist, &spd);
+    if (spd <= 0) {
+      Serial.println(F("ERR: speed must be > 0"));
+      break;
+    }
+    moveUm(fabs(dist), spd);
+    break;
+  }
+  case 'D':
+  case 'd': {
+    float dist = 0, spd = 0;
+    sscanf(args.c_str(), "%f %f", &dist, &spd);
+    if (spd <= 0) {
+      Serial.println(F("ERR: speed must be > 0"));
+      break;
+    }
+    moveUm(-fabs(dist), spd);
+    break;
+  }
+  case 'S':
+  case 's': {
+    long st = 0;
+    float spd = 0;
+    sscanf(args.c_str(), "%ld %f", &st, &spd);
+    if (spd <= 0) {
+      Serial.println(F("ERR: speed must be > 0"));
+      break;
+    }
+    moveSteps(st, spd);
+    reportPosition();
+    break;
+  }
+  case 'T':
+  case 't': {
+    float spd = 0, dur = 0;
+    sscanf(args.c_str(), "%f %f", &spd, &dur);
+    if (dur <= 0) {
+      Serial.println(F("ERR: duration must be > 0"));
+      break;
+    }
+    moveForDuration(spd, dur);
+    break;
+  }
+  case 'V':
+  case 'v': {
+    float spd = 0;
+    sscanf(args.c_str(), "%f", &spd);
+    float stepsPerSec = spd / umPerMicrostep();
+    stepper.setSpeed(stepsPerSec);
+    continuousMode = true;
+    Serial.print(F("Continuous velocity: "));
+    Serial.print(spd, 2);
+    Serial.println(F(" um/s"));
+    break;
+  }
+  case 'M':
+  case 'm': {
+    int div = atoi(args.c_str());
+    applyMicrostepping(div);
+    Serial.print(F("Microstepping set to 1/"));
+    Serial.println(microstepping);
+    break;
+  }
+  case 'P':
+  case 'p':
+    reportPosition();
+    break;
+  case 'H':
+  case 'h':
+    stepper.setCurrentPosition(0);
+    Serial.println(F("Home position set (0 um)"));
+    break;
+  case 'X':
+  case 'x':
+    disableDriver();
+    Serial.println(F("Driver DISABLED (free-spin)"));
+    break;
+  case 'R':
+  case 'r':
+    enableDriver();
+    Serial.println(F("Driver ENABLED"));
+    break;
+  case '?':
+    printHelp();
+    break;
+  default:
+    Serial.print(F("Unknown command: "));
+    Serial.println(op);
+    printHelp();
+    break;
+  }
+}
+
+void printHelp() {
+  Serial.println(F(""));
+  Serial.println(F("═══ Z-Axis Controller Commands ═══"));
+  Serial.println(F("  U <um> <um/s>                 Move UP"));
+  Serial.println(F("  D <um> <um/s>                 Move DOWN"));
+  Serial.println(
+      F("  S <steps> <um/s>              Move raw microsteps (+/-)"));
+  Serial.println(
+      F("  T <um/s> <sec>                Move at speed for duration"));
+  Serial.println(F("  V <um/s>                      Continuous velocity mode"));
+  Serial.println(F("  M <1|2|4|8|16>                Set microstepping"));
+  Serial.println(F("  P                             Report position"));
+  Serial.println(F("  H                             Set home (zero)"));
+  Serial.println(F("  X                             Disable driver"));
+  Serial.println(F("  R                             Enable driver"));
+  Serial.println(F("  ?                             This help"));
+  Serial.println(F(""));
+}
+
+// ---------------------------------------------------------------------------
+//  SETUP
+// ---------------------------------------------------------------------------
+void setup() {
+  // Pin modes
+  pinMode(PIN_MS1, OUTPUT);
+  pinMode(PIN_MS2, OUTPUT);
+  pinMode(PIN_MS3, OUTPUT);
+
+  // AccelStepper configuration
+  stepper.setEnablePin(PIN_ENABLE);
+  stepper.setPinsInverted(
+      (DIR_UP == LOW), false,
+      true); // Invert dir if DIR_UP is LOW, Enable is Active-Low
+
+  // Default state: driver enabled, 1/16 microstepping
+  enableDriver();
+  applyMicrostepping(16);
+
+  Serial.begin(115200);
+  delay(200);
+
+  Serial.println(F(""));
+  Serial.println(F("╔══════════════════════════════════════════════════════╗"));
+  Serial.println(F("║  Z-Axis Motor Controller — Tungsten Tip Etching     ║"));
+  Serial.println(F("║  A4988 + MinebeaMitsumi Hybrid Stepper              ║"));
+  Serial.println(F("╚══════════════════════════════════════════════════════╝"));
+  Serial.print(F("  Step resolution: "));
+  Serial.print(umPerMicrostep(), 4);
+  Serial.println(F(" um/microstep"));
+  Serial.print(F("  Microstepping:   1/"));
+  Serial.println(microstepping);
+  Serial.print(F("  Lead pitch:      "));
+  Serial.print(PITCH_UM, 1);
+  Serial.println(F(" um/rev"));
+  Serial.println(F(""));
+  printHelp();
+}
+
+// ---------------------------------------------------------------------------
+//  MAIN LOOP — serial command processing
+// ---------------------------------------------------------------------------
+String serialBuffer = "";
+
+void loop() {
+  while (Serial.available()) {
+    char c = Serial.read();
+    if (c == '\n' || c == '\r') {
+      serialBuffer.trim();
+      if (serialBuffer.length() > 0) {
+        processCommand(serialBuffer);
+      }
+      serialBuffer = "";
+    } else {
+      serialBuffer += c;
+    }
+  }
+
+  // Non-blocking motion execution
+  if (continuousMode) {
+    stepper.runSpeed();
+  } else {
+    stepper.run();
+  }
+}

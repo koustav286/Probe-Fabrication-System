@@ -1,0 +1,49 @@
+#include <AccelStepper.h>
+
+#define STEP_PIN 2
+#define DIR_PIN 3
+
+AccelStepper stepper(AccelStepper::DRIVER, STEP_PIN, DIR_PIN);
+
+#define STEPS_PER_MM 3200
+
+float distances[] = {2, 1.5, 1.5, 1, 0.5};
+float speeds[] = {640, 240, 120, 53.3, 20};
+
+int totalStages = 5;
+
+int stage = 0;
+bool stageRunning = false;
+
+void setup() {
+  pinMode(DIR_PIN, OUTPUT);
+  digitalWrite(DIR_PIN, HIGH);
+
+  // Smooth transition control
+  stepper.setAcceleration(300);
+}
+
+void loop() {
+
+  if (stage < totalStages) {
+
+    if (!stageRunning) {
+      long steps = distances[stage] * STEPS_PER_MM;
+
+      // Only set max speed (NOT setSpeed)
+      stepper.setMaxSpeed(speeds[stage]);
+
+      // Move to next position smoothly
+      stepper.move(steps);
+
+      stageRunning = true;
+    }
+
+    stepper.run(); // handles smooth accel/decel
+
+    if (stepper.distanceToGo() == 0) {
+      stage++;
+      stageRunning = false;
+    }
+  }
+}

@@ -1,61 +1,139 @@
-# Probe Fabrication System (Electrochemical Etching)
+# Probe Fabrication System — Electrochemical Etching
 
-This repository contains the control software and firmware for an automated Z-Axis Linear Motion Controller used in **Tungsten Tip Electrochemical Etching**. The system creates ultra-sharp tungsten probes (used in STM, AFM, etc.) by precisely controlling the extraction of a tungsten wire from an etchant solution while monitoring the etching current.
+Control software and firmware for an automated Z-axis linear motion controller used in **tungsten tip electrochemical etching**. Creates ultra-sharp tungsten probes (STM, AFM, etc.) by precisely controlling wire extraction from an etchant solution while monitoring etching current in real-time.
 
-## Features
+## System Architecture
 
-- **Automated Z-Axis Motion:** Controls a hybrid stepper motor (via A4988 driver) to smoothly extract the probe from the etchant.
-- **Current Monitoring:** Real-time current sensing (via INA219 via I2C) to detect the exact moment the probe "drops off" and finishes etching.
-- **Auto-Cutoff Relay:** Instantly cuts the etching voltage using a GPIO relay when the drop-off is detected to prevent blunting the tip.
-- **Multi-Phase Etching Profiles:** 
-  - *Static Etching:* Wire remains stationary.
-  - *Dynamic Etching:* Wire is gradually pulled out at a constant/variable speed to control the probe taper/apex radius.
-- **Environment Logging:** Automatically reads a DHT22 sensor (Temperature & Humidity) to log environmental conditions during fabrication for reproducibility.
+A **Raspberry Pi** handles all sensing, decision-making, and logging. A dedicated **microcontroller** receives motion commands over serial and generates step/direction pulses for the stepper driver. The serial command protocol is identical across both hardware targets.
 
-## Hardware Architecture
-
-1. **Microcontroller (Arduino Uno/Nano):** 
-   - Runs `MotorController.ino`.
-   - Directly interfaces with the A4988 stepper motor driver.
-   - Listens to serial commands (`U`, `D`, `S`, `T`, `V`) to move the Z-axis stage.
-2. **Controller (Raspberry Pi):** 
-   - Runs the Python etch scripts (e.g., `advanced_dynamic_etch.py`).
-   - Monitors the INA219 current sensor via I2C (`0x40`).
-   - Controls the power relay on GPIO 17.
-   - Reads the DHT22 on GPIO 27.
-   - Communicates with the Arduino over USB/Serial (`/dev/ttyACM0`).
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  Raspberry Pi                                                   │
+│  ┌──────────────┐  ┌───────────┐  ┌───────┐  ┌──────────────┐  │
+│  │ INA219 (I2C) │  │ Relay GPIO│  │ DHT22 │  │  CSV Logger  │  │
+│  │ Current Sense│  │ Power Cut │  │ Temp/H│  │  ~/LogFiles/ │  │
+│  └──────────────┘  └───────────┘  └───────┘  └──────────────┘  │
+│                         Serial (V/U/D/S/T/P/H/X/R)             │
+└────────────────────────────┬────────────────────────────────────┘
+                             │
+              ┌──────────────┴──────────────┐
+              │                             │
+     ┌────────▼────────┐          ┌─────────▼────────┐
+     │  UnoCode/        │          │  STM32Code/       │
+     │  Arduino Uno     │          │  Blue Pill         │
+     │  + A4988 driver  │          │  + DM542 driver    │
+     │  USB Serial      │          │  UART Serial       │
+     └─────────────────┘          └──────────────────┘
+```
 
 ## Directory Structure
 
-- `/Dynamic_Etch_Release/` - Contains the production-ready etching scripts and firmware.
-  - `Advanced_Dynamic/` - Advanced continuous pull etching profile.
-  - `Basic_Dynamic/` - Basic dynamic pull profile.
-  - `MultiPhase_Static/` - Step-by-step static etching profile.
-  - `Motor_Test/` - Utilities for calibrating and testing the stepper motor stage.
-- `/Existing Code/` - Legacy and reference scripts.
-- `/oldcodes/` - Deprecated code versions.
+```
+MotorController/
+├── STM32Code/                   ← Active: Blue Pill (STM32F103C8) + DM542
+│   ├── src/main.cpp             Firmware (PlatformIO / STM32duino)
+│   ├── platformio.ini           PlatformIO build & upload config
+│   ├── advanced_dynamic_etch.py Pi-side etch controller (UART serial)
+│   └── PIN_SETUP.md             Complete wiring & DIP switch reference
+│
+├── UnoCode/                     ← Legacy: Arduino Uno + A4988
+│   ├── Advanced_Dynamic/        Advanced continuous-pull etch profile
+│   ├── Basic_Dynamic/           Basic dynamic pull profile
+│   ├── MultiPhase_Static/       Step-by-step static etch profile
+│   ├── Motor_Test/              Stepper calibration & test utilities
+│   └── PIN_SETUP.md             Complete wiring reference
+│
+├── Ideas/                       Design notes & reference papers
+│   ├── newideas.md              Blue Pill + DM542 migration notes
+│   └── scholarworks_uark_etching_paper.md
+│
+├── Existing Code/               Early development scripts & logs
+├── oldcodes/                    Deprecated code versions
+└── README.md                    ← You are here
+```
 
-## Setup & Usage
+## Hardware Targets
 
-### 1. Arduino Firmware
-- Open `Dynamic_Etch_Release/Advanced_Dynamic/MotorController.ino` in the Arduino IDE.
-- Adjust `PITCH_UM` and `microstepping` to match your specific lead screw and driver configuration.
-- Flash to your Arduino Uno/Nano.
+| | **STM32Code** (Current) | **UnoCode** (Legacy) |
+|---|---|---|
+| **MCU** | Blue Pill (STM32F103C8) | Arduino Uno/Nano (ATmega328P) |
+| **Driver** | DM542 (industrial, opto-isolated) | A4988 (breakout board) |
+| **Microstepping** | DM542 DIP switches (hardware) | MS1/2/3 pins (software) |
+| **Serial link** | UART — `/dev/ttyAMA0` | USB — `/dev/ttyACM0` |
+| **Step pins** | PA0 / PA1 / PA2 | D2 / D3 / D4 |
+| **Max pulse rate** | 200 kHz | ~20 kHz |
+| **Dev environment** | PlatformIO + ST-Link | Arduino IDE |
 
-### 2. Python Environment (Raspberry Pi)
-Ensure you have the required dependencies installed:
+> See `PIN_SETUP.md` inside each folder for full wiring tables and DIP switch settings.
+
+## Etching Profiles
+
+| Profile | Description |
+|---------|-------------|
+| **Advanced Dynamic** | Static neck-formation phase → constant-speed dynamic pull → auto drop-off detection with dI/dt smoothing and inrush stabilization |
+| **Basic Dynamic** | Simpler continuous pull at fixed speed |
+| **MultiPhase Static** | Wire stays stationary; step-wise etching phases |
+| **Motor Test** | Standalone stepper calibration and speed testing |
+
+## Serial Command Protocol
+
+Both firmware targets accept the same ASCII commands over serial (115200 baud, newline-terminated):
+
+| Command | Action |
+|---------|--------|
+| `V <um/s>` | Continuous velocity mode (primary etch command) |
+| `U <um> <um/s>` | Move up by distance at speed |
+| `D <um> <um/s>` | Move down by distance at speed |
+| `S <steps> <um/s>` | Move raw microsteps (+/−) at speed |
+| `T <um/s> <sec>` | Move at speed for duration |
+| `P` | Report current position |
+| `H` | Set current position as home (zero) |
+| `X` | Disable driver (free-spin) |
+| `R` | Re-enable driver |
+| `M <div>` | Set microstepping (Uno only; ignored on STM32) |
+
+## Quick Start — STM32 Setup
+
+### 1. Flash the Blue Pill
+
+Install [PlatformIO](https://platformio.org/) and connect an ST-Link V2:
+
+```bash
+cd STM32Code
+pio run --target upload
+```
+
+### 2. Wire the DM542
+
+Connect PUL+/DIR+/ENA+ to a **5V rail**, and PUL−/DIR−/ENA− to PA0/PA1/PA2 (sinking mode). See [STM32Code/PIN_SETUP.md](STM32Code/PIN_SETUP.md) for the full diagram.
+
+### 3. Connect Blue Pill to Pi
+
+Direct 3.3V UART — no level shifter needed:
+
+```
+Blue Pill PA9  (TX) ──► Pi GPIO15 (RXD)
+Blue Pill PA10 (RX) ◄── Pi GPIO14 (TXD)
+GND ──────────────────── GND
+```
+
+Disable the Pi serial console: `sudo raspi-config` → Interface Options → Serial → No login shell, Yes hardware.
+
+### 4. Pi Dependencies
+
 ```bash
 pip install pyserial smbus2 lgpio adafruit-circuitpython-dht
 ```
 
-### 3. Running an Etch
-1. Mount the tungsten wire to the Z-axis stage and submerge the tip into the etchant (e.g., KOH).
-2. Connect the etching circuit (power supply through the INA219 and Relay to the etching cell).
-3. Run the desired profile:
+### 5. Run an Etch
+
 ```bash
-python Dynamic_Etch_Release/Advanced_Dynamic/advanced_dynamic_etch.py
+cd STM32Code
+python advanced_dynamic_etch.py
 ```
-4. Follow the on-screen prompts to enter metadata (dipped length, concentration). The script will automatically wait for the power supply to stabilize, begin the etching profile, and cut power instantly when the tip drops off.
+
+Follow the prompts to enter metadata. The script auto-detects power supply stabilization, runs the etch profile, and cuts power instantly on drop-off.
 
 ## Logs & Data
-All etching runs are logged automatically as CSV files in `~/LogFiles/` on the Raspberry Pi, containing timestamps, real-time current (mA), motor speed, and environmental metadata.
+
+All runs are logged as timestamped CSV files in `~/LogFiles/` on the Pi, containing current readings, state transitions, motor speed, and experiment metadata (temperature, humidity, dipped length, etchant concentration).

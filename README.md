@@ -47,9 +47,7 @@ MotorController/
 │   ├── newideas.md              Blue Pill + DM542 migration notes
 │   └── scholarworks_uark_etching_paper.md
 │
-├── Existing Code/               Early development scripts & logs
-├── oldcodes/                    Deprecated code versions
-└── README.md                    ← You are here
+└── OldCode/                     Early development scripts & logs
 ```
 
 ## Hardware Targets
